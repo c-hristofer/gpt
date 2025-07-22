@@ -11,13 +11,13 @@ from torch.nn import functional as F
 
 # Hyperparameters
 batch_size      = 64 # How many independent sequences will be processed in paralel
-block_size      = 128 # THe maximum context length for predictions
+block_size      = 256 # THe maximum context length for predictions
 max_iters       = 5000
-eval_interval   = 100
-learning_rate   = 1e-4
-device          = 'cuda' if torch.cuda.is_available() else 'cpu'
+eval_interval   = 500
+learning_rate   = 3e-4
+device          = 'mps' if torch.backends.mps.is_available() else 'cpu'
 eval_iters      = 200
-n_embd          = 126
+n_embd          = 384
 n_head          = 6
 n_layer         = 6
 dropout         = 0.2
@@ -26,7 +26,7 @@ dropout         = 0.2
 torch.manual_seed(1337)
 
 # Read in tiny shakespeare
-with open('sisyphus.txt', 'r', encoding='utf-8') as f:
+with open('shakespeare.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # All the unique characters that occur in the text
@@ -65,7 +65,11 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
+            if device == 'mps':
+                with torch.autocast('mps', dtype=torch.float16):
+                    logits, loss = model(X, Y)
+            else:
+                logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -90,7 +94,7 @@ class Head(nn.Module):
         q = self.query(x)   # (B, T, C)
 
         # Compute attention scores ("affinities")
-        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
@@ -107,7 +111,7 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embd, n_embd)
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -149,7 +153,7 @@ class Block(nn.Module):
         return x
 
 
-class BigramLanguageModel(nn.Module):
+class GPTLanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
@@ -159,6 +163,16 @@ class BigramLanguageModel(nn.Module):
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # Final Layer Norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -206,7 +220,7 @@ class BigramLanguageModel(nn.Module):
 
         return idx
 
-model = BigramLanguageModel()
+model = GPTLanguageModel()
 m = model.to(device)
 
 # Create a PyTorch optimizer using AdamW optimizer
@@ -221,10 +235,24 @@ for iter in range(max_iters):
     # Sample a batch of data
     xb, yb = get_batch('train')
     # Evaluate loss
-    logits, loss = m(xb, yb)
+    if device == 'mps':
+        with torch.autocast('mps', dtype=torch.float16):
+            logits, loss = m(xb, yb)
+    else:
+        logits, loss = m(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+# Generate a large chunk of text and trim to 1,000 lines
+generated_ids = m.generate(context, max_new_tokens=100000)[0].tolist()
+generated_text = decode(generated_ids)
+lines = generated_text.splitlines()
+# If we have fewer than 1,000 lines, pad with empty lines
+if len(lines) < 1000:
+    lines += [""] * (1000 - len(lines))
+final_text = "\n".join(lines[:1000])
+print(final_text)
+with open("generated-shakespeare.txt", "w") as f:
+    f.write(final_text)
