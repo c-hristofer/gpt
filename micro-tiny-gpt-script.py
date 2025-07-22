@@ -10,20 +10,23 @@ from torch.nn import functional as F
 #-------------------------------------------------------------------------------
 
 # Hyperparameters
-batch_size      = 32 # How many independent sequences will be processed in paralel
-block_size      = 8 # THe maximum context length for predictions
-max_iters       = 10000
-eval_interval   = 500
-learning_rate   = 1e-3
+batch_size      = 64 # How many independent sequences will be processed in paralel
+block_size      = 128 # THe maximum context length for predictions
+max_iters       = 5000
+eval_interval   = 100
+learning_rate   = 1e-4
 device          = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters      = 200
-n_embd          = 32
+n_embd          = 126
+n_head          = 6
+n_layer         = 6
+dropout         = 0.2
 #--------------------
 
 torch.manual_seed(1337)
 
 # Read in tiny shakespeare
-with open('shakespeare.txt', 'r', encoding='utf-8') as f:
+with open('sisyphus.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # All the unique characters that occur in the text
@@ -68,16 +71,18 @@ def estimate_loss():
     model.train()
     return out
 
+# One head of self attention
 class Head(nn.Module):
 
     def __init__(self, head_size):
         super().__init__()
         # Each token directly reads off the logits for the next token from a lookup table
-        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.key   = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C= x.shape
@@ -88,6 +93,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
 
         # Perform the weighted aggregation of the values
         v = self.value(x)   # (B, T, C)
@@ -101,9 +107,46 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+
+# A simple Linear layer followed by non-linearity
+class FeedForward(nn.Module):
+    
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# Transformer Block: Communication followed by computation
+class Block(nn.Module):
+
+    def __init__(self, n_embd, n_head):
+        # n_embd: Embedding dimension, n_head: the number of heads I would like
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1  = nn.LayerNorm(n_embd)
+        self.ln2  = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
 
 
 class BigramLanguageModel(nn.Module):
@@ -113,7 +156,8 @@ class BigramLanguageModel(nn.Module):
         # Each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_head = Head(n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # Final Layer Norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
     
     def forward(self, idx, targets=None):
@@ -123,7 +167,8 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B, T, C) This is a Tensor with Batch, Time, Channel
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = tok_emb + pos_emb   # (B, T, C)
-        x = self.sa_head(x)     # Apply one head of self-attention. (B, T, C)
+        x = self.blocks(x)      # (B, T, C)
+        x = self.ln_f(x)        # (B, T, C)
         logits = self.lm_head(x)# (B, T, vocab_size)
 
 
@@ -131,8 +176,8 @@ class BigramLanguageModel(nn.Module):
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B*T, C)                            # Turn it into 2D Array
-            targets = targets.view(B*T)                             # Turn it into 1D Array
+            logits = logits.view(B * T, C)                            # Turn it into 2D Array
+            targets = targets.view(B * T)                             # Turn it into 1D Array
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
@@ -170,7 +215,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 for iter in range(max_iters):
 
     # Every once in a while, evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
+    if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
     # Sample a batch of data
