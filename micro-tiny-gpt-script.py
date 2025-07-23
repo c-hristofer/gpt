@@ -12,7 +12,7 @@ from torch.nn import functional as F
 # Hyperparameters
 batch_size      = 64 # How many independent sequences will be processed in paralel
 block_size      = 256 # THe maximum context length for predictions
-max_iters       = 5000
+max_iters       = 3000
 eval_interval   = 500
 learning_rate   = 3e-4
 device          = 'mps' if torch.backends.mps.is_available() else 'cpu'
@@ -20,7 +20,8 @@ eval_iters      = 200
 n_embd          = 384
 n_head          = 6
 n_layer         = 6
-dropout         = 0.2
+dropout         = 0.1
+warmup_steps    = 1000            # LR warm‑up duration (updates)
 #--------------------
 
 torch.manual_seed(1337)
@@ -119,6 +120,7 @@ class MultiHeadAttention(nn.Module):
         out = self.proj(out)
         return out
 
+
 # A simple Linear layer followed by non-linearity
 class FeedForward(nn.Module):
     
@@ -173,7 +175,32 @@ class GPTLanguageModel(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens):
+        # idx is (B,T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            
+            # Crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
+
+            # Get the predictions
+            logits, loss = self(idx_cond)
+
+            # Focus only on the last time step
+            logits = logits[:, -1, :]  # Becomes (B, C)
+
+            # Apply softmax to get probabilities
+            probs = F.softmax(logits, dim=1)  # (B, C)
+
+            # Sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+            # Append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+
+        return idx
+
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
@@ -196,35 +223,19 @@ class GPTLanguageModel(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
-        # idx is (B,T) array of indices in the current context
-        for _ in range(max_new_tokens):
-            
-            # Crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
-
-            # Get the predictions
-            logits, loss = self(idx_cond)
-
-            # Focus only on the last time step
-            logits = logits[:, -1, :]                           # Becomes (B, C)
-
-            # Apply softmax to get probabilities
-            probs = F.softmax(logits, dim=1)                    # (B, C)
-
-            # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-
-            # Append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1)             # (B, T+1)
-
-        return idx
 
 model = GPTLanguageModel()
 m = model.to(device)
 
 # Create a PyTorch optimizer using AdamW optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+# Cosine decay schedule that starts *after* the warm‑up
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=max_iters - warmup_steps,
+    eta_min=1e-5,
+)
 
 for iter in range(max_iters):
 
@@ -242,11 +253,20 @@ for iter in range(max_iters):
         logits, loss = m(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)  # grad clip
     optimizer.step()
+
+    # ----- learning‑rate schedule -----
+    if iter < warmup_steps:
+        lr_scale = (iter + 1) / warmup_steps
+        for g in optimizer.param_groups:
+            g["lr"] = learning_rate * lr_scale
+    else:
+        scheduler.step()
 
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 # Generate a large chunk of text and trim to 1,000 lines
-generated_ids = m.generate(context, max_new_tokens=100000)[0].tolist()
+generated_ids = m.generate(context, max_new_tokens=40000)[0].tolist()
 generated_text = decode(generated_ids)
 lines = generated_text.splitlines()
 # If we have fewer than 1,000 lines, pad with empty lines
@@ -254,5 +274,5 @@ if len(lines) < 1000:
     lines += [""] * (1000 - len(lines))
 final_text = "\n".join(lines[:1000])
 print(final_text)
-with open("generated-shakespeare.txt", "w") as f:
+with open("generated-shakespeare2.txt", "w") as f:
     f.write(final_text)
