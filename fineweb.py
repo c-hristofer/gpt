@@ -46,8 +46,13 @@ if __name__ == '__main__':
     from multiprocessing import freeze_support
     freeze_support()
 
+if __name__ == '__main__':
+    from multiprocessing import freeze_support
+    freeze_support()
+    mp.set_start_method('fork', force=True)
     nprocs = max(1, os.cpu_count()//2)
-    with mp.Pool(nprocs) as pool:
+    pool = mp.Pool(nprocs)
+    try:
         shard_index = 0
         # preallocate buffer to hold current shard
         all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
@@ -84,3 +89,6 @@ if __name__ == '__main__':
             split = "val" if shard_index == 0 else "train"
             filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
             write_datafile(filename, all_tokens_np[:token_count])
+    finally:
+        pool.close()
+        pool.join()
