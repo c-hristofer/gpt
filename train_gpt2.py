@@ -41,8 +41,8 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_casual=True) # Flash Attention
-        y = y.transpoe(1, 2).contiguous().view(B, T, C) # Reassemble all head outputs side by side
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # Flash Attention
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # Reassemble all head outputs side by side
         y = self.c_proj(y)
         return y
 
@@ -186,7 +186,7 @@ class GPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # Start with all of the candidate parameters (that require grad)
-        param_dict = {pn: p for pn, p in self.names_parameters()}
+        param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
         # Create optim groups. Any parameters tha are 2D will be weight decayed, otherwise no
