@@ -2,6 +2,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from hellaswag import render_example, iterate_examples
 from torch.nn import functional as F
+from transformers import GPT2LMHeadModel
 from dataclasses import dataclass
 import torch.distributed as dist
 import torch.nn as nn
@@ -12,6 +13,7 @@ import torch
 import math
 import time
 import os
+import gc
 
 # ------------------------------------------
 
@@ -78,7 +80,12 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    # Comment in and out when running on cloud
     block_size: int = 1024 # Max Sequence Length
+
+    # # Comment in and out when running locally
+    # block_size: int = 512
+    
     vocab_size: int = 50257 # GPT 2 Tokenizer has length of 50,257. 256 raw byte tokens + 50,000 merges + 1 special token
     n_layer: int = 12 # Number of layers
     n_head: int = 12  # Number of heads
@@ -250,7 +257,7 @@ class DataLoaderLite:
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = (buf[:-1].view(B, T)) # Inputs
-        y = (buf[:-1].view(B, T)) # Inputs
+        y = (buf[1:].view(B, T)) # Targets
 
         # Advance the position in the tensor
         self.current_position += B * T * self.num_processes
@@ -269,8 +276,8 @@ class DataLoaderLite:
 def get_most_likely_row(tokens, mask, logits):
     # Evaluate the autoregressive loss at all positions
     shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (logits[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.siz(-1))
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
     flat_shift_tokens = shift_tokens.view(-1)
     shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
     shift_losses = shift_losses.view(tokens.size(0), -1)
@@ -304,7 +311,7 @@ if ddp:
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # This process will do logging, checkpointin, etc.
@@ -323,7 +330,7 @@ else:
         device = "mps"
     print(f"using device: {device}")
 
-device_type = "cuda" if device.startswith("cuda") else "cpu"
+device_type = "cuda" if device.startswith("cuda") else ("mps" if device == "mps" else "cpu")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -331,9 +338,15 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
+# For training model on cloud
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
 B = 64 # Micro batch size
 T = 1024 # Sequence length
+
+# # For training model locally
+# total_batch_size = 262144 # 2**18, ~0.25M, in number of tokens
+# B = 32 # Micro batch size
+# T = 512 # Sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -358,8 +371,15 @@ raw_model = model.module if ddp else model # Always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
+
+# Comment in and out when running on cloud or not
 warmup_steps = 715
 max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size is 0.5M tokens
+
+# # Comment in and out when running locally or not
+# warmup_steps = 10
+# max_steps = 20
+
 def get_lr(it):
     # 1) Linear warmip for warmup_iters steps
     if it < warmup_steps:
@@ -419,7 +439,7 @@ for step in range(max_steps):
                 # I might also want to add optimizer.state_dict() and
                 # rng seeds etc., if I wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
- # once in a while evaluate hellaswag
+    # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
@@ -451,6 +471,12 @@ for step in range(max_steps):
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} hella {acc_norm:.4f}\n")
+
+        # # Comment in and out depending if I'm running locally on my mac or not. Frees memory after HellaSwag eval
+        # del logits, mask, tokens
+        # gc.collect()
+        # torch.mps.empty_cache()
+        # time.sleep(1)
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
